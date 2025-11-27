@@ -1,0 +1,3543 @@
+{
+  "name": "Alpha",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "0051d70d-89d1-489b-9d52-2cc75895fc66",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        1920,
+        -496
+      ],
+      "id": "32e701cf-8657-4b30-a21f-80bccd9f0ca6",
+      "name": "Webhook",
+      "webhookId": "0051d70d-89d1-489b-9d52-2cc75895fc66"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        2096,
+        -496
+      ],
+      "id": "ad5b98d7-e184-4a32-b697-e688fe978f8e",
+      "name": "Get a row",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "models/gemini-2.5-flash",
+          "mode": "list",
+          "cachedResultName": "models/gemini-2.5-flash"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "={{ (() => {\n  // --- Input Data ---\n  // Safely get session data from 'Get a row' node. Default to {} if empty.\n  const row = $('Get a row').item?.json ?? {};\n  // Safely get user's message text from Webhook. Default to ''.\n  const body = $('Webhook').item.json.body?.Body ?? '';\n  // Get current timestamp for relative date calculations.\n  const now = new Date().toISOString();\n\n  // --- Base Instructions (Updated for reschedule fields & selected_turf_id) ---\n  const baseInstructions = `\n    - Analyze the user's message STRICTLY based on the current context provided below.\n    - Timezone: Assume all times relate to 'Asia/Kolkata' (IST, UTC+5:30). Convert FINAL times to ISO 8601 format including the '+05:30' offset.\n    - Ambiguous Times: Interpret times like \"7\" as evening (7 PM / 19:00) unless \"AM\", \"subah\", or \"morning\" is explicitly mentioned.\n    - Output Format: Respond ONLY with a valid JSON object containing \"intent\", \"date\" (YYYY-MM-DD), \"startTimeISO\", and \"endTimeISO\". Include \"selected_turf_id\" if available in the context. Include \"original_date\" (YYYY-MM-DD) and \"original_startTimeISO\" only if the intent is 'reschedule_request' or 'cancel_request'. Return \"null\" for any value that cannot be reliably determined based on the rules for the current context.`;\n\n  // --- Logic Based on Conversation State ---\n  let specificPrompt = '';\n\n  // --- State: Processing CORRECTION after showing details ---\n  // --- (UNCHANGED logic, but will add selected_turf_id to output instruction) ---\n  if (row.last_question === 'awaiting_confirmation') {\n    specificPrompt = `\n    **CRITICAL INSTRUCTION: Apply corrections to the time ONLY unless the user explicitly states a NEW DATE. If no explicit new date is found, the FINAL date MUST remain ${row.date}.**\n\n    **Context:** You are a booking assistant processing a correction.\n    The user was previously shown these details:\n    * Original Date: ${row.date}\n    * Original Start: ${row.start_time_iso}\n    * Original End: ${row.end_time_iso}\n    * Selected Turf ID: ${row.selected_turf_id}\n\n    The user's correction message is: \"${body}\"\n\n    **Task: Rules to determine FINAL values:**\n    1)  **Date Rule (hard lock):**\n        - Keep the date as **${row.date}** by default.\n        - Change the date ONLY if the user's message explicitly specifies a new calendar date... (rest of rules unchanged) ...\n    2)  **Time Rule:**\n        - Parse FINAL start/end time from the correction text... (rest of rules unchanged) ...\n        - If only a single specific start time is given in the correction, assume a 1-hour slot: end = start + 1 hour.\n    3)  **Intent:** Set the intent to \"correction\".\n\n    ${baseInstructions}\n    * Include the \"selected_turf_id\": ${row.selected_turf_id} in the final JSON output.`;\n  }\n  // --- State: User providing TIME DETAILS after selecting turf ---\n  // --- (UNCHANGED logic, but will add selected_turf_id to output instruction) ---\n  else if (row.last_question === 'awaiting_time_details') {\n    specificPrompt = `\n    **Context:** You are processing the user's response after they selected a turf (ID: ${row.selected_turf_id}) and were asked for the date and time.\n    User's Time Message: \"${body}\"\n    Today's date is ${now}.\n\n    **Task:** Extract the date, start time, and potentially the end time.\n    1.  **Date Rule:** Determine the date based on the message (\"aaj\", \"kal\", \"parson\", specific date).\n    2.  **Time Rule:** Extract start time. If an end time or duration (e.g., \"for 2 hours\") is NOT mentioned, the endTimeISO **MUST be null**. DO NOT assume a 1-hour duration at this stage.\n    3.  **Intent:** Set the intent to \"time_details\".\n\n    ${baseInstructions}\n    * Include the \"selected_turf_id\": ${row.selected_turf_id} in the final JSON output.`;\n  }\n  // --- State: User replying AFTER being shown ALTERNATIVES ---\n  // --- (UNCHANGED logic, but will add selected_turf_id to output instruction) ---\n  else if (row.last_question === 'offered_alternatives_or_new_request') {\n    specificPrompt = `\n    **Context:** The user's original booking request failed (slot unavailable). They were shown alternative slots for the original date (${row.date}) and asked to choose, suggest a new date, or check other turfs. The originally intended turf ID was ${row.selected_turf_id}.\n    User's Reply: \"${body}\"\n    Original requested time was likely around ${row.start_time_iso}. Today's date is ${now}.\n\n    **Task:** Determine the user's intent and extract details.\n    1.  **Intent Analysis:** Classify the reply into one intent: 'choose_alternative_time', 'request_new_date', 'check_other_turfs', 'abort_booking', or 'unclear'.\n        - 'abort_booking': If negative sentiment (\"no thanks\", \"cancel\", \"rehne do\", \"thank you\").\n        - 'check_other_turfs': If they ask about other venues (\"check other turfs\").\n        - 'request_new_date': If they mention a new date (\"kal\", \"tomorrow\", \"parson\", \"try 28th\"). Extract the new date. Keep the original time (${row.start_time_iso} to ${row.end_time_iso}) unless they specify a new one.\n        - 'choose_alternative_time': If they pick a time from the suggestions or provide a new time for the original date (${row.date}). Extract the date (${row.date}), startTimeISO, and endTimeISO (assume 1 hour if only start is given).\n        - If none of the above match clearly, set intent to 'unclear'.\n    2.  **Data Extraction:** Extract date/times only if relevant to the identified intent. Return nulls otherwise.\n    3.  **Intent:** Set the identified intent string.\n\n    ${baseInstructions}\n    * Include the \"selected_turf_id\": ${row.selected_turf_id} in the final JSON output.`;\n  }\n  // --- NEW State: User providing NEW TIME for RESCHEDULE ---\n  else if (row.last_question === 'awaiting_reschedule_details') {\n    specificPrompt = `\n    **Context:** You are processing the user's response after they confirmed they want to reschedule their booking (Original Booking ID: ${row.original_booking_id}, Turf ID: ${row.selected_turf_id}) and were asked for the NEW desired date and time.\n    User's New Time Message: \"${body}\"\n    Today's date is ${now}.\n\n    **Task:** Extract the NEW date, start time, and potentially the end time for the reschedule request. The turf cannot be changed.\n    1.  **Date Rule:** Determine the NEW date based on the message (\"aaj\", \"kal\", \"parson\", specific date).\n    2.  **Time Rule:** Extract the NEW start time. If a NEW end time or duration is NOT mentioned, the endTimeISO **MUST be null**. DO NOT assume a 1-hour duration at this stage.\n    3.  **Intent:** Set the intent to \"reschedule_time_provided\".\n\n    ${baseInstructions}\n    * Include the \"selected_turf_id\": ${row.selected_turf_id} in the final JSON output.`;\n  }\n  // --- State: NO Active Session (NEW Conversation OR Reschedule/Cancel Request) ---\n  else {\n    // Check for keywords BEFORE assuming it's a new booking\n    const lowerBody = body.toLowerCase();\n    if (lowerBody.includes('reschedule') || lowerBody.includes('change my booking') || lowerBody.includes('change time for')) {\n      // --- This is a RESCHEDULE Request ---\n      specificPrompt = `\n      **Context:** Analyzing a message from a user. There is NO active conversation session, but the message indicates they want to RESCHEDULE an existing booking.\n      User's Request: \"${body}\"\n      Today's date is ${now}.\n      **Task:** Identify the intent as 'reschedule_request' and try to extract details of the ORIGINAL booking they want to change (date and start time).\n      1.  **Intent:** Set intent to \"reschedule_request\".\n      2.  **Original Booking Extraction:** Look for mentions of the date and start time of the booking they want to change (e.g., \"change my booking for tomorrow 7 PM\", \"reschedule the slot on 20th Oct at 5\"). Extract these as original_date and original_startTimeISO. If details aren't clear, return null for them.\n      3.  **New Time Extraction:** Do NOT extract any new time details in this step. Set date, startTimeISO, endTimeISO to null.\n      ${baseInstructions}`; // Base instructions updated for output format (includes original_date/time)\n    } else if (lowerBody.includes('cancel booking') || lowerBody.includes('need to cancel')) {\n      // --- This is a CANCEL Request ---\n      specificPrompt = `\n      **Context:** Analyzing a message from a user. There is NO active conversation session, but the message indicates they want to CANCEL an existing booking.\n      User's Request: \"${body}\"\n      Today's date is ${now}.\n      **Task:** Identify the intent as 'cancel_request' and try to extract details of the ORIGINAL booking they want to cancel (date and start time).\n      1.  **Intent:** Set intent to \"cancel_request\".\n      2.  **Original Booking Extraction:** Look for mentions of the date and start time of the booking they want to cancel. Extract these as original_date and original_startTimeISO. If details aren't clear, return null for them.\n      3.  **New Time Extraction:** Set date, startTimeISO, endTimeISO to null.\n      ${baseInstructions}`; // Base instructions updated for output format (includes original_date/time)\n    } else {\n      // --- This is likely a NEW Booking Request ---\n      // --- (UNCHANGED logic) ---\n      specificPrompt = `\n      **Context:** You are starting a new conversation with a user about booking a turf.\n      User's First Message: \"${body}\"\n      Today's date is ${now}.\n      **Task:** Extract the initial booking details.\n      1.  **Date Rule:** Determine the date.\n      2.  **Time Rule:** Extract start time. If an end time or duration is NOT mentioned, the endTimeISO **MUST be null**. DO NOT assume a 1-hour duration.\n      3.  **Intent:** Set the intent to \"new_booking\".\n      ${baseInstructions}`;\n    }\n  }\n\n  // Return the constructed prompt for the AI\n  return specificPrompt;\n\n})() }}"
+            }
+          ]
+        },
+        "jsonOutput": true,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.googleGemini",
+      "typeVersion": 1,
+      "position": [
+        3328,
+        -448
+      ],
+      "id": "4eae3e07-ea60-474b-a48a-48b11219e8f5",
+      "name": "Message a model1",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "LHjnh0bKZ3OhF4ad",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const textFromAI = $input.first().json.content.parts[0].text;\nconst parsedData = JSON.parse(textFromAI);\nreturn parsedData;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3680,
+        -448
+      ],
+      "id": "de46097b-d96d-4fb4-8f69-c2fa425c2d8f",
+      "name": "ParseAIOutput1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e1ea7695-5587-43bb-a7d4-250506361bbc",
+              "leftValue": "={{ $json.date }}",
+              "rightValue": "",
+              "operator": {
+                "type": "dateTime",
+                "operation": "exists",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "ccd508de-c380-443c-9d39-4ceaf03ea1bc",
+              "leftValue": "={{ $json.startTimeISO }}",
+              "rightValue": "",
+              "operator": {
+                "type": "dateTime",
+                "operation": "exists",
+                "singleValue": true
+              }
+            },
+            {
+              "id": "0443d342-4040-4c6b-a45c-e65d74f98f26",
+              "leftValue": "={{ $json.endTimeISO }}",
+              "rightValue": "",
+              "operator": {
+                "type": "dateTime",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4464,
+        -1120
+      ],
+      "id": "c63ef8f2-164c-4c49-b000-b338324ed101",
+      "name": "Are all details complete?"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ParseAIOutput node se data lena\nconst data = $input.first().json;\nlet reply = \"\";\n\n// Check karna ki kaun si information missing hai aur uske hisaab se sawaal banana\nif (data.date === null) {\n  reply = \"It seems you haven't mentioned a date. Please tell me the date for your booking.\";\n} else if (data.startTimeISO === null) {\n  reply = \"Thanks for the date! What time slot would you like to book?\";\n} else if (data.endTimeISO === null) {\n  reply = \"Great, I have the start time. What's the end time for your booking? A standard slot is 1 hour.\";\n} else {\n  // Yeh ek fallback message hai, agar koi anehoni ho\n  reply = \"Sorry, I'm having trouble understanding. Please provide the date, start time, and end time for your booking.\";\n}\n\n// Banaye gaye reply message ko aage bhejna\nreturn [{\n  json: {\n    replyMessage: reply\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4640,
+        -1008
+      ],
+      "id": "2be59f0e-b39c-4fcb-839f-99152801323d",
+      "name": "Build Missing Info Reply"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "={{$node[\"Build Missing Info Reply\"].json.replyMessage}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        4976,
+        -1008
+      ],
+      "id": "7ad9c986-10f8-4896-9e78-7dfb3cb6a81c",
+      "name": "Send an SMS/MMS/WhatsApp message4",
+      "credentials": {
+        "twilioApi": {
+          "id": "Cio49pnWa5N36izf",
+          "name": "Twilio account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Turfs",
+        "returnAll": true,
+        "filterType": "none"
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3216,
+        -848
+      ],
+      "id": "2cb90b5f-2b02-41ed-b312-f9b1f0939fc9",
+      "name": "Get many rows",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Supabase se mili saari turfs ki list\nconst turfs = items;\n\n// Message ki shuruaat\nlet message = \"Welcome to TurfBook! Please choose a turf to book by replying with its name or serial number:\\n\\n\";\n\n// Har turf ko ek number ke saath list mein jodna\nturfs.forEach((turf, index) => {\n  message += `${index + 1}. ${turf.json.name}\\n`;\n});\n\n// Banaye gaye message ko aage bhejna\nreturn [{\n  json: {\n    replyMessage: message\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3392,
+        -848
+      ],
+      "id": "2e137c66-1b1c-409a-8a69-b928baa2a157",
+      "name": "Build Turf List Message"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "={{$node[\"Build Turf List Message\"].json.replyMessage}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        3568,
+        -848
+      ],
+      "id": "91b08687-0001-41ea-b6f0-6e914708929d",
+      "name": "Send an SMS/MMS/WhatsApp message6",
+      "credentials": {
+        "twilioApi": {
+          "id": "Cio49pnWa5N36izf",
+          "name": "Twilio account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "tableId": "Sessions",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "user_number",
+              "fieldValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            },
+            {
+              "fieldId": "last_question",
+              "fieldValue": "awaiting_turf_choice"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3744,
+        -848
+      ],
+      "id": "1eeb4a56-1e57-47ac-95af-3784c1c058c8",
+      "name": "Create a row1",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.last_question }}",
+                    "rightValue": "",
+                    "operator": {
+                      "type": "string",
+                      "operation": "notExists",
+                      "singleValue": true
+                    },
+                    "id": "02622171-e6ef-4bc7-a7d2-9844e08e7234"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "da7c673f-bca7-4696-82e5-12c36a2427fd",
+                    "leftValue": "={{ $json.last_question }}",
+                    "rightValue": "awaiting_turf_choice",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "0ac9fb79-5cd1-4faa-b09d-fdfc1da0431e",
+                    "leftValue": "={{ $json.last_question }}",
+                    "rightValue": "awaiting_time_details",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f713f68a-f0b1-4d20-b6f8-2509f042f0cc",
+                    "leftValue": "={{ $json.last_question }}",
+                    "rightValue": "awaiting_confirmation",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "5f6c65f6-b18f-4415-bd6e-e232268d221f",
+                    "leftValue": "={{ $json.last_question }}",
+                    "rightValue": "offered_alternatives_or_new_request",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "3dfb341d-a16b-493d-bd49-db79ab427e74",
+                    "leftValue": "={{ $json.last_question }}",
+                    "rightValue": "other_turf_chosen",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "219d6f28-7ded-44ed-8434-e85045d3aa0e",
+                    "leftValue": "={{ $json.last_question }}",
+                    "rightValue": "awaiting_reschedule_details",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2560,
+        -592
+      ],
+      "id": "313e89fd-83af-4ceb-b5cd-1ada783f7c90",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Turfs"
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3200,
+        -656
+      ],
+      "id": "da4fec47-6ed9-4d96-86fa-979ea567d54e",
+      "name": "Get many rows1",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Smart turf selector: serial number OR flexible name input\n// - items: array of { json: { id, name, owner_email, google_calender_id, ... } } from Supabase. [web:34]\n// - Webhook body: $(\"Webhook\").first().json.body.Body (e.g., \"2\", \"kukki\", \"kukki turf\", \"SACHIN\") [web:4]\n// Strategy:\n// 1) If reply is a valid 1-based index, select directly.\n// 2) Otherwise, interpret as name intent:\n//    a) Normalize input and turf names (lowercase, remove diacritics/punct, collapse spaces). [web:80]\n//    b) Extract first-name tokens from user input and from registered turf names.\n//    c) Match priority:\n//       P1: exact normalized equality on full name.\n//       P2: exact normalized equality on first-name.\n//       P3: user query contains first-name OR first-name contains user query.\n//       P4: substring match on full normalized names.\n//       P5: fuzzy match (Levenshtein similarity) on first-name, then full name, with thresholds.\n// Notes: Assumes first-name across turfs is unique (e.g., \"kukki\", \"sachin\"). If collision, P1/P4 will still disambiguate via fuller text.\n// Returns: [{ json: matchedItem.json }] or [{ json: {} }] if not found.\n\nfunction normalizeString(str) {\n  if (!str && str !== 0) return '';\n  return String(str)\n    .normalize('NFD')                     // split base + diacritics [web:80]\n    .replace(/[\\u0300-\\u036f]/g, '')     // remove diacritic marks [web:80]\n    .toLowerCase()                        // case-insensitive compare [web:84]\n    .replace(/[^a-z0-9\\s]/g, '')         // strip punctuation [web:80]\n    .replace(/\\s+/g, ' ')                 // collapse spaces [web:80]\n    .trim();                              // trim ends [web:80]\n}\n\n// Extract a \"first-name\" token: first word from normalized string.\n// Examples: \"kukki's playturf\" -> \"kukkis\" -> \"kukkis\" first token -> \"kukkis\"; \"Sachin Arena\" -> \"sachin\".\nfunction firstToken(normStr) {\n  const parts = (normStr || '').split(' ').filter(Boolean);\n  return parts[0] || '';\n}\n\n// Levenshtein edit distance + similarity for fuzzy fallback. [web:86][web:92]\nfunction editDistance(a, b) {\n  a = a || ''; b = b || '';\n  const m = a.length, n = b.length;\n  if (m === 0) return n;\n  if (n === 0) return m;\n  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));\n  for (let i = 0; i <= m; i++) dp[i][0] = i;\n  for (let j = 0; j <= n; j++) dp[0][j] = j;\n  for (let i = 1; i <= m; i++) {\n    for (let j = 1; j <= n; j++) {\n      const cost = a[i - 1] === b[j - 1] ? 0 : 1;\n      dp[i][j] = Math.min(\n        dp[i - 1][j] + 1,\n        dp[i][j - 1] + 1,\n        dp[i - 1][j - 1] + cost\n      );\n    }\n  }\n  return dp[m][n];\n}\nfunction similarity(a, b) {\n  const longer = a.length >= b.length ? a : b;\n  const shorter = a.length >= b.length ? b : a;\n  if (longer.length === 0) return 1;\n  const dist = editDistance(longer, shorter);\n  return (longer.length - dist) / longer.length; // 0..1 [web:86]\n}\n\n// Read user reply (could be \"2\" or a turf name phrase)\nconst userReplyRaw = $(\"Webhook\").first().json.body?.Body;\nconst userReply = (userReplyRaw ?? '').trim(); // safe trim [web:4]\n\n// Supabase list\nconst allTurfs = items; // array of { json: {...} } [web:34]\nif (!Array.isArray(allTurfs) || allTurfs.length === 0) {\n  return [{ json: {} }];\n}\n\n// 1) Numeric selection (1-based)\nconst idxParsed = parseInt(userReply, 10);\nif (!Number.isNaN(idxParsed)) {\n  const pos = idxParsed - 1;\n  if (pos >= 0 && pos < allTurfs.length) {\n    return [{ json: allTurfs[pos].json }];\n  }\n}\n\n// 2) Name-based selection\nconst qNorm = normalizeString(userReply);                 // normalized full query [web:80]\nconst qFirst = firstToken(qNorm);                         // intended first-name [web:80]\n\n// Precompute normalized forms for each turf\nconst catalog = allTurfs.map((it, i) => {\n  const full = normalizeString(it?.json?.name ?? '');     // e.g., \"kukki s playturf\" [web:80]\n  const first = firstToken(full);                         // e.g., \"kukki\" [web:80]\n  return { i, full, first };\n});\n\n// Priority P1: exact equality on full normalized name\nlet winner = catalog.find(x => x.full === qNorm);\nif (winner) {\n  return [{ json: allTurfs[winner.i].json }];\n}\n\n// Priority P2: exact equality on first-name\nif (!winner && qFirst) {\n  winner = catalog.find(x => x.first === qFirst);\n  if (winner) {\n    return [{ json: allTurfs[winner.i].json }];\n  }\n}\n\n// Priority P3: query contains first-name OR first-name contains query (handles “kukki turf”, “the sachin arena”)\nif (!winner && qNorm) {\n  winner = catalog.find(x => qNorm.includes(x.first) || x.first.includes(qNorm));\n  if (winner) {\n    return [{ json: allTurfs[winner.i].json }];\n  }\n}\n\n// Priority P4: substring match on full normalized names (handles partials beyond first token)\nif (!winner && qNorm) {\n  winner = catalog.find(x => x.full.includes(qNorm) || qNorm.includes(x.full));\n  if (winner) {\n    return [{ json: allTurfs[winner.i].json }];\n  }\n}\n\n// Priority P5: fuzzy on first-name, then full name as secondary\nif (!winner && qFirst) {\n  let best = { i: -1, score: 0 };\n  for (const x of catalog) {\n    const s = similarity(x.first, qFirst);               // first-name similarity [web:86]\n    if (s > best.score) best = { i: x.i, score: s };\n  }\n  if (best.i >= 0 && best.score >= 0.82) {               // slightly stricter for short tokens [web:86]\n    return [{ json: allTurfs[best.i].json }];\n  }\n}\n\n// Secondary fuzzy on full names (more tolerant)\nif (!winner && qNorm) {\n  let best = { i: -1, score: 0 };\n  for (const x of catalog) {\n    const s = similarity(x.full, qNorm);                 // full-name similarity [web:86]\n    if (s > best.score) best = { i: x.i, score: s };\n  }\n  if (best.i >= 0 && best.score >= 0.75) {               // tolerant threshold for phrases [web:86]\n    return [{ json: allTurfs[best.i].json }];\n  }\n}\n\n// No match — return empty for downstream prompt\nreturn [{ json: {} }];\n\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3392,
+        -656
+      ],
+      "id": "5457ac8b-cd4e-4f7e-a354-8c472ddb9631",
+      "name": "Find Selected Turf"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "=Great! You've selected {{ $json.name }}.\nWhat date and time would you like to book?",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        3568,
+        -656
+      ],
+      "id": "fedc6a43-1d86-4cb8-a6dc-13aee52c8342",
+      "name": "Send an SMS/MMS/WhatsApp message7",
+      "credentials": {
+        "twilioApi": {
+          "id": "Cio49pnWa5N36izf",
+          "name": "Twilio account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "selected_turf_id",
+              "fieldValue": "={{ $('Find Selected Turf').item.json.id }}"
+            },
+            {
+              "fieldId": "last_question",
+              "fieldValue": "awaiting_time_details"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3744,
+        -656
+      ],
+      "id": "0dfb7a6a-6b98-4b0c-9ece-aa995cba7fd7",
+      "name": "Update a row",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "Turfs",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "keyValue": "={{$(\"Get a row\").first().json.selected_turf_id}}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4624,
+        -1232
+      ],
+      "id": "1a154a2a-b178-4f67-91bc-0b22aa835e87",
+      "name": "Get a row1",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{ $('Webhook').item.json.body.WaId }}",
+        "toWhatsapp": true,
+        "message": "=Please confirm your booking details:\n\nTurf: {{ $node[\"Get a row1\"].json.name }}\nDate: {{ $node[\"ParseAIOutput1\"].json.date }}\nTime: {{ DateTime.fromISO($('ParseAIOutput1').item.json.startTimeISO, { setZone: true }).toFormat('h:mm a') }}​ - {{ DateTime.fromISO($('ParseAIOutput1').item.json.endTimeISO, { setZone: true }).toFormat('h:mm a') }}​\n\nReply \"Yes\" to confirm, or send the full corrected date & time.\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        4800,
+        -1232
+      ],
+      "id": "f9bcca54-3ac1-4395-9517-3dcebc249eef",
+      "name": "Send an SMS/MMS/WhatsApp message9",
+      "credentials": {
+        "twilioApi": {
+          "id": "Cio49pnWa5N36izf",
+          "name": "Twilio account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "date",
+              "fieldValue": "={{$node[\"ParseAIOutput1\"].json.date}}"
+            },
+            {
+              "fieldId": "start_time_iso",
+              "fieldValue": "={{$node[\"ParseAIOutput1\"].json.startTimeISO}}"
+            },
+            {
+              "fieldId": "end_time_iso",
+              "fieldValue": "={{$node[\"ParseAIOutput1\"].json.endTimeISO}}"
+            },
+            {
+              "fieldId": "last_question",
+              "fieldValue": "awaiting_confirmation"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4976,
+        -1232
+      ],
+      "id": "4c761355-4306-47fd-8cfc-9cd5586dfb56",
+      "name": "Update a row1",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "user_number",
+              "fieldValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            },
+            {
+              "fieldId": "date",
+              "fieldValue": "={{ $('ParseAIOutput1').item.json.date }}"
+            },
+            {
+              "fieldId": "start_time_iso",
+              "fieldValue": "={{ $('ParseAIOutput1').item.json.startTimeISO }}"
+            },
+            {
+              "fieldId": "end_time_iso",
+              "fieldValue": "={{ $('ParseAIOutput1').item.json.endTimeISO }}"
+            },
+            {
+              "fieldId": "last_question",
+              "fieldValue": "=awaiting_confirmation"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4816,
+        -1008
+      ],
+      "id": "78328c6f-440e-47c9-917f-ef1508dd1a90",
+      "name": "Update a row2",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Bookings",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "turf_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.selected_turf_id }}"
+            },
+            {
+              "keyName": "status",
+              "condition": "eq",
+              "keyValue": "confirmed"
+            },
+            {
+              "keyName": "start_time",
+              "condition": "lt",
+              "keyValue": "={{ $json.end_time_iso }}"
+            },
+            {
+              "keyName": "end_time",
+              "condition": "gt",
+              "keyValue": "={{ $json.start_time_iso }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3504,
+        -224
+      ],
+      "id": "d1faf8f5-ccb8-4753-b620-833b0ff1acc4",
+      "name": "Check Bookings for Overlap",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get the items from the previous Supabase node\nconst overlaps = items;\n\n// Check if the list is empty OR if the first item is truly empty\n// (Handles both [] and [{}] cases)\nconst isAvailable = overlaps.length === 0 || !overlaps[0].json.id;\n\n// Output a simple true/false value\nreturn { json: { isSlotAvailable: isAvailable } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3680,
+        -224
+      ],
+      "id": "10f69ec4-9313-475d-b3ed-92624b7a726f",
+      "name": "Process Overlap Check"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{ $('Webhook').item.json.body.WaId }}",
+        "toWhatsapp": true,
+        "message": "=Great news! The slot you requested is available.\n\nPlease pay the ₹1 advance to confirm your booking using the link below.\n{{$json[\"short_url\"]}}\n\nThis link is valid for 10 minutes. As per our policy, the advance is non-refundable, but you can reschedule your slot once.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        4272,
+        -240
+      ],
+      "id": "c3f2b278-e96e-4a90-82ba-b568f34ba220",
+      "name": "Send an SMS/MMS/WhatsApp message10",
+      "credentials": {
+        "twilioApi": {
+          "id": "Cio49pnWa5N36izf",
+          "name": "Twilio account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "89d970a5-78c7-4257-a3b3-f03176801bfc",
+              "leftValue": "={{ $json.isSlotAvailable }}",
+              "rightValue": "is True",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3872,
+        -224
+      ],
+      "id": "ac31436e-9107-47d2-828b-f353465eab54",
+      "name": "IsSlotAvailable?2"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.razorpay.com/v1/payment_links",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpBasicAuth",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "amount",
+              "value": "={{ parseInt(\"100\") }}"
+            },
+            {
+              "name": "currency",
+              "value": "INR"
+            },
+            {
+              "name": "description",
+              "value": "Advance Booking for Turf Slot"
+            },
+            {
+              "name": "customer",
+              "value": "={{ { \"contact\": $node[\"Webhook\"].json.body.WaId.slice(2), \"name\": $node[\"Webhook\"].json.body.ProfileName } }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4096,
+        -240
+      ],
+      "id": "17e2b475-150a-4d00-ad76-402e4cc75d53",
+      "name": "HTTP Request2",
+      "credentials": {
+        "httpBasicAuth": {
+          "id": "eAmoQKQUT5U1y6qY",
+          "name": "Unnamed credential"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Bookings",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "turf_id",
+              "condition": "eq",
+              "keyValue": "={{ $('Switch2').item.json.selected_turf_id }}"
+            },
+            {
+              "keyName": "status",
+              "condition": "eq",
+              "keyValue": "confirmed"
+            },
+            {
+              "keyName": "start_time",
+              "condition": "gte",
+              "keyValue": "={{DateTime.fromISO($node[\"Get user requested slot details\"].json.date).startOf('day').toISO()}}"
+            },
+            {
+              "keyName": "start_time",
+              "condition": "lt",
+              "keyValue": "={{DateTime.fromISO($node[\"Get user requested slot details\"].json.date).plus({days: 1}).startOf('day').toISO()}}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4272,
+        -48
+      ],
+      "id": "e0fe1920-1f03-4e5b-b36a-df7496b76a9e",
+      "name": "Get all Bookings today",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node (Run Once for All Items)\n// Purpose:\n// - Compute accurate free time ranges (to the minute) within operating window,\n//   subtracting precise booked intervals (including 30/40/90-minute bookings).\n// - Return compact, user-friendly ranges. Optionally cap each range to <= 3 hours for display.\n\n// Inputs:\n// - items: array from Supabase node; each item.json has start_time, end_time as \"YYYY-MM-DD HH:mm:ss\" (timestamp WITHOUT tz)\n// - \"Get user requested slot details\" provides .json.date as \"YYYY-MM-DD\"\n\n// Config\nconst openingHour = 5;    // 05:00 IST\nconst closingHour = 24;   // 24:00 IST (end-exclusive)\nconst tzName = 'Asia/Kolkata';\nconst IST_OFFSET = '+05:30';\nconst MAX_DISPLAY_BLOCK_HOURS = 3;   // Split longer free ranges into chunks up to 3 hours\nconst ENFORCE_MAX_BLOCKS = true;     // set false if you want full ranges without splitting\n\n// Helpers\nfunction istISO(y, m, d, H=0, M=0, S=0, ms=0) {\n  const mm = String(m).padStart(2, '0');\n  const dd = String(d).padStart(2, '0');\n  const HH = String(H).padStart(2, '0');\n  const MM = String(M).padStart(2, '0');\n  const SS = String(S).padStart(2, '0');\n  const mss = String(ms).padStart(3, '0');\n  return `${y}-${mm}-${dd}T${HH}:${MM}:${SS}.${mss}${IST_OFFSET}`;\n}\nfunction istDate(y, m, d, H=0, M=0, S=0, ms=0) {\n  return new Date(istISO(y, m, d, H, M, S, ms));\n}\n// Supabase timestamp (no tz) -> IST Date\nfunction parseSupabaseAsIST(ts) {\n  // \"YYYY-MM-DD HH:mm:ss\" -> \"YYYY-MM-DDTHH:mm:ss+05:30\"\n  return new Date(ts.replace(' ', 'T') + IST_OFFSET);\n}\nconst fmt = new Intl.DateTimeFormat('en-IN', {\n  hour: 'numeric',\n  minute: '2-digit',\n  hour12: true,\n  timeZone: tzName,\n});\nfunction formatIST(d) { return fmt.format(d); }\n\n// Inputs\nconst bookedEvents = items;\nconst requestedDate = $('Get user requested slot details').first().json.date; // \"YYYY-MM-DD\"\n\n// Parse Y-M-D\nif (!requestedDate || requestedDate.length < 10) {\n  return [{ json: { error: true, reason: \"Missing/invalid requestedDate\", requestedDate } }];\n}\nconst y = parseInt(requestedDate.slice(0, 4), 10);\nconst m = parseInt(requestedDate.slice(5, 7), 10);\nconst d = parseInt(requestedDate.slice(8, 10), 10);\n\n// Operating window (exact, minute-accurate)\nconst dayStart = istDate(y, m, d, openingHour, 0, 0, 0);\nconst dayEnd   = istDate(y, m, d, closingHour, 0, 0, 0); // end-exclusive\n\n// 1) Collect booked intervals intersecting the day window, with minute precision\nconst rawIntervals = [];\nfor (const ev of bookedEvents) {\n  const st = ev?.json?.start_time;\n  const et = ev?.json?.end_time;\n  if (!st || !et) continue;\n\n  const es = parseSupabaseAsIST(st); // exact minutes preserved\n  const ee = parseSupabaseAsIST(et);\n  if (isNaN(es) || isNaN(ee)) continue;\n\n  // Clip to window bounds to stay within the day\n  const s = Math.max(es.getTime(), dayStart.getTime());\n  const e = Math.min(ee.getTime(), dayEnd.getTime());\n  if (e > s) rawIntervals.push([s, e]);\n}\n\n// 2) Merge overlaps/adjacent intervals (precision: ms)\nrawIntervals.sort((a, b) => a[0] - b[0]);\nconst bookedMerged = [];\nfor (const cur of rawIntervals) {\n  if (!bookedMerged.length || cur[0] > bookedMerged[bookedMerged.length - 1][1]) {\n    bookedMerged.push(cur);\n  } else {\n    bookedMerged[bookedMerged.length - 1][1] =\n      Math.max(bookedMerged[bookedMerged.length - 1][1], cur[1]);\n  }\n}\n\n// 3) Subtract booked from [dayStart, dayEnd) to get free gaps\nconst freeGaps = [];\nlet cursor = dayStart.getTime();\n\nfor (const [bS, bE] of bookedMerged) {\n  if (bS > cursor) {\n    freeGaps.push([cursor, bS]); // free gap before this booking\n  }\n  cursor = Math.max(cursor, bE); // advance past booking\n}\n// Tail gap after last booking\nif (cursor < dayEnd.getTime()) {\n  freeGaps.push([cursor, dayEnd.getTime()]);\n}\n\n// 4) Optionally split long free gaps into max 3-hour chunks for display brevity\nconst HOUR_MS = 60 * 60 * 1000;\nconst maxChunk = MAX_DISPLAY_BLOCK_HOURS * HOUR_MS;\n\nconst displayGaps = [];\nfor (const [s, e] of freeGaps) {\n  if (!ENFORCE_MAX_BLOCKS || e - s <= maxChunk) {\n    displayGaps.push([s, e]);\n  } else {\n    let start = s;\n    while (start < e) {\n      const end = Math.min(start + maxChunk, e);\n      displayGaps.push([start, end]);\n      start = end;\n    }\n  }\n}\n\n// 5) Format lines\nconst rangesIST = displayGaps.map(([s, e]) => `${formatIST(new Date(s))} - ${formatIST(new Date(e))}`);\n\n// Build message\nlet message = '';\nif (rangesIST.length === 0) {\n  message = `Sorry, no slots are available on ${requestedDate}. Please share another date or preferred time window.`;\n} else {\n  message = `Available slots on ${requestedDate} (IST, up to ${MAX_DISPLAY_BLOCK_HOURS} hours per block):\\n` +\n            rangesIST.join('\\n');\n}\n\n// Output\nreturn [\n  {\n    json: {\n      availableSlotsMessage: message,\n      meta: {\n        date: requestedDate,\n        timezone: tzName,\n        openingHour,\n        closingHour,\n        minuteAccurate: true,\n        chunkedToHours: ENFORCE_MAX_BLOCKS ? MAX_DISPLAY_BLOCK_HOURS : null,\n      },\n      rangesIST, // minute-accurate free ranges\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4464,
+        -48
+      ],
+      "id": "6d71e2ad-6800-45de-90d4-2bfa8b9a4f59",
+      "name": "Generate suggestions"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "13662235-71d6-4a79-9069-d54f553334fb",
+              "leftValue": "={{ $('Webhook').item.json.body.Body }}",
+              "rightValue": "yes",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3120,
+        -336
+      ],
+      "id": "5985a23c-19c3-4a88-bc5a-64506804a848",
+      "name": "If2",
+      "alwaysOutputData": true,
+      "executeOnce": false
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Webhook').item.json.body.Body }}",
+                    "rightValue": "yes",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    },
+                    "id": "cdade3c1-a146-4e1d-99d3-1ad60ad9939c"
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3312,
+        -224
+      ],
+      "id": "3d5e1691-3987-40c2-b199-226ce625e5f5",
+      "name": "Switch2"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4096,
+        -48
+      ],
+      "id": "0ee6af1f-6b49-4f9b-a763-d48abbc6906c",
+      "name": "Get user requested slot details",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Format user-facing message from upstream data\n// Inputs (from previous node via $input.first().json):\n// - availableSlotsMessage: string (not required here, but available)\n// - meta: { date, timezone, openingHour, closingHour }\n// - rangesIST: array of human-readable IST free ranges, e.g. [\"5:00 am - 7:00 am\", \"8:00 am - 7:00 pm\", \"8:00 pm - 12:00 am\"]\n// Optional extras you can supply via previous node or Set node:\n// - placeName: \"Tapish's turf\" or \"Vaidik's Turf\"\n// - requestedWindow: \"7 PM - 8 PM\" (string to include in User Request echo)\n// - userRequestText: full user request echo if desired\n\n// Helper: title-case AM/PM and normalize spacing\nfunction normalizeRange(str) {\n  if (typeof str !== 'string') return str;\n  let s = str.trim();\n  s = s.replace(/\\b(am|pm)\\b/g, m => m.toUpperCase()); // am/pm -> AM/PM\n  s = s.replace(/\\s+/g, ' ');\n  return s;\n}\n\n// Helper: shrink a long free range to multiple max-3-hour subranges\nfunction splitRangeToMax3Hours(rangeStr) {\n  // Input like \"8:00 AM - 7:00 PM\"\n  // For simplicity, since upstream rangesIST are already merged and human-readable,\n  // we will not parse clock math here; instead, we assume upstream has already limited\n  // free ranges to reasonable sizes OR you accept showing the full block.\n  // If you need strict chunking, do it upstream where timestamps exist.\n  return [normalizeRange(rangeStr)];\n}\n\n// Read inputs\nconst input = $input.first().json || {};\nconst meta = input.meta || {};\nconst rangesIST = Array.isArray(input.rangesIST) ? input.rangesIST : [];\n\n// Optional extras (set these upstream as needed)\nconst placeName = input.placeName || '';             // e.g., \"Tapish's turf\"\nconst requestedWindow = input.requestedWindow || ''; // e.g., \"7 PM - 8 PM\"\nconst userRequestText = input.userRequestText || ''; // e.g., 'Book Tapish\\'s turf for 27th October, 7 PM to 8 PM'\n\n// Build header/context\nconst dateStr = meta.date || 'the selected date';\nconst placePart = placeName ? ` at ${placeName}` : '';\n\n// Normalize and optionally split ranges to max 3 hours for display\n// Note: If you truly must enforce 3-hour caps, do the chunking upstream using timestamps.\n// Here we keep it simple and just normalize text.\nconst displayRanges = [];\nfor (const r of rangesIST) {\n  const chunks = splitRangeToMax3Hours(r);\n  for (const c of chunks) displayRanges.push(c);\n}\n\n// Compose message per your style\nlet header = `Sorry, the slot you requested is unavailable for ${dateStr}${placePart}.`;\n\nlet rangesSection = '';\nif (displayRanges.length > 0) {\n  rangesSection = `\\n\\nHere are the available time ranges for that day:\\n` +\n                  displayRanges.join('\\n');\n} else {\n  rangesSection = `\\n\\nUnfortunately, there are no other available slots for that day.`;\n}\n\nconst footer = `\\n\\nIf none of these times work, you can reply with a different date or check other turfs for your time.`;\n\n// Optional: Echo user's request line if you want a prefixed \"User Request\"\nlet userRequestEcho = '';\nif (userRequestText) {\n  userRequestEcho = `User Request: \"${userRequestText}\"\\n\\n`;\n} else if (placeName && requestedWindow) {\n  userRequestEcho = `User Request: \"Book ${placeName} for ${dateStr}, ${requestedWindow}\"\\n\\n`;\n}\n\n// Final message\nconst message = `${userRequestEcho}${header}${rangesSection}${footer}`;\n\n// Also provide lines array for UI\nreturn [\n  {\n    json: {\n      message,\n      lines: displayRanges,\n      meta: {\n        date: dateStr,\n        placeName: placeName || undefined,\n        timezone: meta.timezone || 'Asia/Kolkata',\n        openingHour: meta.openingHour,\n        closingHour: meta.closingHour,\n      }\n    }\n  }\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4656,
+        -48
+      ],
+      "id": "b948df16-ee47-4126-bbb5-8cd4ea0a9bff",
+      "name": "Code1"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "new_booking",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "4f01ca4d-43ab-45a1-9171-00d2652a0bec"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c12ec451-a90e-4de0-9d43-da4fd23e0856",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "time_details",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "0a553472-5447-4dee-b336-59e73f12febe",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "correction",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "227a10e0-3769-4e9e-8389-7fde17c09f69",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "choose_alternative_time",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "9ae5474d-225c-4810-bd92-11c861b231f0",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "request_new_date",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "eb0cad26-d4f3-4865-95ea-9fa955752956",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "check_other_turfs",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "190e43ac-f1fa-41f3-bc5b-d7ca8fb4d9a9",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "abort_booking",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "bf4cfc33-0be7-4be5-a159-9ebe3e616175",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "unclear",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "818329c8-d3c0-451d-87c0-60fce828d93f",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "change_turf",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "f9c089c5-1450-4d72-a558-e65ae8f9ab70",
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "reschedule_time_provided",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        4016,
+        -832
+      ],
+      "id": "3b7dc303-6338-4c9b-b06d-2af89234322a",
+      "name": "Switch1"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "Okay, no problem. Let me know if you'd like to try booking another time!",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        4496,
+        -640
+      ],
+      "id": "2f8fb1b5-7f07-4ea4-9d7b-716752d6ee98",
+      "name": "Send an SMS/MMS/WhatsApp message11",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "tableId": "Sessions",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4704,
+        -640
+      ],
+      "id": "5825a2a8-29dd-43d7-80a5-b45c8d83a7c0",
+      "name": "Delete a row",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "Sorry, I didn't quite understand. Please choose an available slot from the list, suggest a new date, ask to check other turfs, or reply 'cancel'.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        4704,
+        -464
+      ],
+      "id": "00f4d5aa-3037-4941-989c-a65c5480606c",
+      "name": "Send an SMS/MMS/WhatsApp message12",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "last_question",
+              "fieldValue": "offered_alternatives_or_new_request"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4864,
+        -464
+      ],
+      "id": "99a2ea2f-7bd9-4e06-a48c-d708fc17717c",
+      "name": "Update a row3",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "={{ $json.message }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        4832,
+        -48
+      ],
+      "id": "a2e1ef90-5992-4c03-a994-760556e0b8d9",
+      "name": "Send an SMS/MMS/WhatsApp message13",
+      "credentials": {
+        "twilioApi": {
+          "id": "Cio49pnWa5N36izf",
+          "name": "Twilio account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "={{ $json.to.replace(/^whatsapp:/, '') }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "last_question",
+              "fieldValue": "offered_alternatives_or_new_request"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        5008,
+        -48
+      ],
+      "id": "1a2fef59-1a21-40db-b44d-654e7ea3839c",
+      "name": "Update a row4",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mode: Run Once for All Items\n// Input: Code3 output -> available turfs with {id, name, owner_email, google_calendar_id}\n// Also reads: \"not available turfs\" node for start_time/end_time\n\n// Helper to safely read from a node\nfunction fromNode(name) {\n  try {\n    return $items(name).map(i => i.json);\n  } catch (e) {\n    return [];\n  }\n}\n\n// Get available turfs from Code3 (current input)\nconst availableTurfs = $input.all().map(it => it.json);\n\n// Get time slot info from \"not available turfs\" node (for header timestamps)\nconst notAvailableItems = fromNode('not available turfs');\n\n// Check if we have any available turfs\nif (availableTurfs.length === 0) {\n  const msg = \"No turfs are free in your requested slot.\";\n  return [{ json: { message: msg, available_count: 0 } }];\n}\n\n// ========== Helper Functions ==========\nfunction pad(n) {\n  return String(n).padStart(2, \"0\");\n}\n\nfunction hh(iso) {\n  if (!iso) return \"\";\n  const d = new Date(iso);\n  if (isNaN(d)) return iso;\n  let h = d.getHours();\n  const ampm = h >= 12 ? \"pm\" : \"am\";\n  const h12 = ((h + 11) % 12) + 1;\n  return `${h12}${ampm}`;\n}\n\nfunction dmy(iso) {\n  if (!iso) return \"\";\n  const d = new Date(iso);\n  if (isNaN(d)) return iso;\n  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;\n}\n\n// ========== Extract Time Info ==========\n// Get start/end time from first \"not available turfs\" item (booking slot being checked)\nlet startIso = \"\";\nlet endIso = \"\";\n\nif (notAvailableItems.length > 0) {\n  startIso = notAvailableItems[0].start_time || \"\";\n  endIso = notAvailableItems[0].end_time || \"\";\n}\n\n// ========== Build Message ==========\n// Header with time range (Updated block)\nconst header = `Turfs available between ${hh(startIso)}–${hh(endIso)} on ${dmy(startIso)}:`;\n\n// List: one line per available turf - \"name - id\" (Updated block)\nconst list = availableTurfs.map(it => {\n  const name = it.name || `Turf ${it.id}`;\n  return `${name} - ${it.id}`;\n}).join(\"\\n\");\n\n// Closing line (Updated block)\nconst closing = \"Liked one? Reply with its ID to book.\";\n\n// Final formatted message (Updated block)\nconst finalMessage = [header, \"\", list, \"\", closing].join(\"\\n\");\n\n\n// ========== Return Output ==========\nreturn [{\n  json: {\n    message: finalMessage,\n    available_count: availableTurfs.length,\n    available_turfs: availableTurfs, // full details for downstream use\n    start_time: startIso,\n    end_time: endIso\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5184,
+        -800
+      ],
+      "id": "76b586d3-07a7-4d27-ae31-3cf79dc23017",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3280,
+        96
+      ],
+      "id": "fd017ff3-86ca-41e8-8226-a3c920a871ad",
+      "name": "Get all the details",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "selected_turf_id",
+              "fieldValue": "={{ $('Webhook').item.json.body.Body }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3088,
+        96
+      ],
+      "id": "1368f0ca-ee0a-439e-897b-dd8a44568d24",
+      "name": "Update a row6",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{ $('Webhook').item.json.body.WaId }}",
+        "toWhatsapp": true,
+        "message": "=Please confirm your booking details:\n\nTurf: {{ $json.name }}\nDate: {{ $('Get all the details').item.json.date }}\nTime: {{ $('Get all the details').item.json.start_time_iso }} - {{ $('Get all the details').item.json.end_time_iso }}\n\nReply \"Yes\" to confirm, or send the full corrected date & time.\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        3696,
+        96
+      ],
+      "id": "423bf7e0-095f-4963-9aa5-7d2a917d140e",
+      "name": "Send an SMS/MMS/WhatsApp message14",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "last_question",
+              "fieldValue": "awaiting_confirmation"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3888,
+        96
+      ],
+      "id": "1c507fb7-5da7-4da0-98ed-115d7ad0ee5e",
+      "name": "Update a row7",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Turfs",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $json.selected_turf_id }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3488,
+        96
+      ],
+      "id": "afda2c76-925d-492b-8f4a-dad942383411",
+      "name": "Get many rows2",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Bookings",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "start_time",
+              "condition": "lt",
+              "keyValue": "={{ $('Get a row').item.json.end_time_iso }}"
+            },
+            {
+              "keyName": "end_time",
+              "condition": "gt",
+              "keyValue": "={{ $('Get a row').item.json.start_time_iso }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4496,
+        -800
+      ],
+      "id": "97138550-6539-4595-b564-ea6e4cf5751e",
+      "name": "not available turfs",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Input: multiple items, each with item.json.turf_id\nconst ids = new Set();\nfor (const item of $input.all()) {\n  if (item.json && item.json.turf_id != null) ids.add(item.json.turf_id);\n}\nreturn [{ json: { excludeIds: Array.from(ids) } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4656,
+        -800
+      ],
+      "id": "982e7241-6bda-41cb-95dd-05044426f97b",
+      "name": "Code2"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Turfs"
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4832,
+        -800
+      ],
+      "id": "7868ce6a-92a9-4783-aed2-dd980caa8bdd",
+      "name": "Get many rows3",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Mode: Run Once for All Items\n// Primary input: \"Get many rows3\" -> all turfs (4 items)\n// Reads excludeIds from Code2 node output\n\nconst allTurfs = $input.all(); // all turfs from DB\n\n// Direct safe read from Code2 using $items() with node name\nconst code2Data = $('Code2').item.json;\nconst excludeIds = code2Data.excludeIds || [];\n\nconsole.log('DEBUG excludeIds:', excludeIds); // check execution log\n\n// Convert to Set with string keys for comparison\nconst excludeSet = new Set(excludeIds.map(id => String(id)));\n\nconsole.log('DEBUG excludeSet:', Array.from(excludeSet));\n\n// Filter and return only available turfs\nconst availableTurfs = [];\n\nfor (const item of allTurfs) {\n  const turfId = String(item.json.id); // normalize to string\n  console.log('DEBUG checking turf:', turfId, 'excluded?', excludeSet.has(turfId));\n  \n  if (!excludeSet.has(turfId)) {\n    // This turf is available - keep all fields\n    availableTurfs.push({\n      json: item.json // preserve entire row\n    });\n  }\n}\n\nconsole.log('DEBUG output count:', availableTurfs.length);\n\nreturn availableTurfs;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5008,
+        -800
+      ],
+      "id": "eb517ec8-b374-4111-bd6b-402d3dd899ea",
+      "name": "Code3"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "={{ $json.message }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        5376,
+        -800
+      ],
+      "id": "348e5c8f-7333-42d7-b665-f7f460384213",
+      "name": "Send an SMS/MMS/WhatsApp message",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "={{ $json.user_number }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "last_question",
+              "fieldValue": "other_turf_chosen"
+            },
+            {
+              "fieldId": "date",
+              "fieldValue": "={{ $json.date }}"
+            },
+            {
+              "fieldId": "start_time_iso",
+              "fieldValue": "={{ $json.start_time_iso }}"
+            },
+            {
+              "fieldId": "end_time_iso",
+              "fieldValue": "={{ $json.end_time_iso }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        5760,
+        -800
+      ],
+      "id": "3bdc7767-af92-4d52-a786-7921bd80dff3",
+      "name": "Update a row8",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "keyValue": "={{ $json.to.split(/[-:]/g).pop() }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        5568,
+        -800
+      ],
+      "id": "c510661b-c8ec-402a-ba7c-f4d888931cc0",
+      "name": "Get a row2",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $items().length }}",
+                    "rightValue": 0,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    },
+                    "id": "76986009-315b-4e2d-b580-5754cb709b63"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "c711a3bd-20cc-4885-84b7-bd38efa0176f",
+                    "leftValue": "={{ $items().length }}",
+                    "rightValue": 1,
+                    "operator": {
+                      "type": "number",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "e8574d7a-5f71-4f7e-914b-a42dbb0db69b",
+                    "leftValue": "={{ $items().length }}",
+                    "rightValue": 1,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gt"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        3168,
+        368
+      ],
+      "id": "8a60e073-5c3f-47df-bf7b-07dc688f26b3",
+      "name": "Switch3"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "=Please confirm your reschedule request for the existing booking below:\nDate: {{ $node[\"Find Confirmed Booking\"].json.start_time.slice(0, 10) }} \nTime: {{ DateTime.fromISO($('Find Confirmed Booking').item.json.start_time, { setZone: true }).toFormat('h:mm a') }} – {{ DateTime.fromISO($('Find Confirmed Booking').item.json.end_time, { setZone: true }).toFormat('h:mm a') }}.​\n\n​Please share the new date and time you’d like to reschedule your booking.\n\nReschedule policy:\nOne-time reschedule only; turf cannot be changed.​\nNew date must be within 7 calendar days of the original date.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        3616,
+        272
+      ],
+      "id": "dba6c291-516c-48b4-9759-4968b0551331",
+      "name": "Send an SMS/MMS/WhatsApp message1",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "tableId": "Sessions",
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "user_number",
+              "fieldValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            },
+            {
+              "fieldId": "selected_turf_id",
+              "fieldValue": "={{ $('Find Confirmed Booking').item.json.turf_id }}"
+            },
+            {
+              "fieldId": "last_question",
+              "fieldValue": "awaiting_reschedule_details"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        3824,
+        272
+      ],
+      "id": "afd94d40-231d-4a42-8d93-0e31643af58e",
+      "name": "Create a row",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Bookings",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{$node[\"Webhook\"].json.body.WaId}}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        2976,
+        384
+      ],
+      "id": "4a1cc452-c479-407b-955b-163bef9a0c72",
+      "name": "Find Confirmed Booking",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "788216c2-01e0-4a7f-9c3b-21cdb4d26b46",
+              "leftValue": "={{ $('Find Confirmed Booking').item.json.reschedule_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3392,
+        384
+      ],
+      "id": "4012fbc8-b8e4-4666-b8f6-212501854ed7",
+      "name": "Can Reschedule?"
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Bookings",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        -752
+      ],
+      "id": "8891e9c4-da96-456f-9196-09c36a171a6c",
+      "name": "Get many rows4",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "45d0adec-9a11-465c-9dd2-7cf8a06cc435",
+              "leftValue": "={{ $json.count_prior }}",
+              "rightValue": 1,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2224,
+        -752
+      ],
+      "id": "5003acbd-4835-42f5-a102-2be2971d7395",
+      "name": "If"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "=Would you like to book a new turf or reschedule an existing booking? Please reply with “new” or “reschedule.”",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        2448,
+        -768
+      ],
+      "id": "38d6faef-491e-463a-b9d6-0784d83c88b7",
+      "name": "Send an SMS/MMS/WhatsApp message8",
+      "credentials": {
+        "twilioApi": {
+          "id": "Cio49pnWa5N36izf",
+          "name": "Twilio account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $('Webhook').item.json.body.Body }}",
+                    "rightValue": "new",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    },
+                    "id": "3d07633e-db88-4f22-9018-a609d1bd9f38"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "d42b2fb6-9cfc-4e30-8bab-3cd1942ccca7",
+                    "leftValue": "={{ $('Webhook').item.json.body.Body }}",
+                    "rightValue": "hey",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "3ee4c7da-9325-4b14-8888-286e74d27fc3",
+                    "leftValue": "={{ $('Webhook').item.json.body.Body }}",
+                    "rightValue": "hello",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "1ffe11f0-4ee6-47a3-8ff0-a8171248e1ab",
+                    "leftValue": "={{ $('Webhook').item.json.body.Body }}",
+                    "rightValue": "reschedule",
+                    "operator": {
+                      "type": "string",
+                      "operation": "contains"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "72928768-7191-4e6e-8bbf-616fae69fa42",
+                    "leftValue": "={{ $('Webhook').item.json.body.Body }}",
+                    "rightValue": "reschedule",
+                    "operator": {
+                      "type": "string",
+                      "operation": "notContains"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {
+          "ignoreCase": true
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2240,
+        -560
+      ],
+      "id": "e7d5f85d-b5ad-45dc-9ce5-8a61c9a05b58",
+      "name": "Switch4"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Name this node e.g. \"Build Prior_bookings\"\n// Assumes previous node is named \"Get many rows4\" (adjust nodeName below)\nconst nodeName = 'Get many rows4';\n\n// Pull all items from the Supabase node\nconst supaItems = $items(nodeName);\n\n// Handle cases:\n// - With Always Output Data OFF and no matches: supaItems.length === 0\n// - With Always Output Data ON and no matches: supaItems.length === 1 && empty JSON\nconst isSingleEmpty =\n  supaItems.length === 1 && Object.keys(supaItems[0].json || {}).length === 0;\n\nlet prior = [];\nif (!isSingleEmpty && supaItems.length > 0) {\n  // Normalize to plain JSON array of rows\n  prior = supaItems.map(it => it.json);\n}\n\n// Return one item with Prior_bookings array\nreturn [\n  {\n    json: {\n      Prior_bookings: prior,\n      // Optional helpers:\n      has_prior: prior.length > 0,\n      count_prior: prior.length,\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2064,
+        -752
+      ],
+      "id": "ea22e012-2003-4855-83f5-b3065176f56a",
+      "name": "Code4"
+    },
+    {
+      "parameters": {
+        "jsCode": "// n8n Code node: Validate reschedule window using previous booking + user-selected date\n// Sources:\n// - Previous booking date: $input.first().json.start_time is like \"2025-10-27T07:00:00\" (from current item), and also available as {{$node[\"Find Confirmed Booking\"].json.start_time.slice(0, 10)}}\n// - User-selected date: $('ParseAIOutput1').first().json.date (e.g., \"2025-10-26\")\n// Output: { json: { isDateValid: boolean, reason: string|null, originalDate: string, newDate: string, ... } }\n\n// ---------- Helpers ----------\nfunction parseAsLocalStartOfDay(dateStr) {\n  if (!dateStr) return null; // guard when field missing [web:39]\n  const d = new Date(dateStr); // JS Date parses ISO and yyyy-mm-dd reliably for our use here [web:40]\n  if (isNaN(d)) return null; // invalid date guard [web:40]\n  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0, 0); // normalize to midnight local to avoid TZ drift in day math [web:36][web:38]\n}\n\nfunction dayDiff(a, b) {\n  const msPerDay = 24 * 60 * 60 * 1000; // milliseconds per day [web:40]\n  const a0 = new Date(a.getFullYear(), a.getMonth(), a.getDate()); // clamp to midnight local [web:36]\n  const b0 = new Date(b.getFullYear(), b.getMonth(), b.getDate()); // same for b [web:36]\n  return Math.round((b0 - a0) / msPerDay); // integer day difference [web:45]\n}\n\nfunction safeFirst(nodeLabel) {\n  try { return $(nodeLabel).first() || null; } catch (e) { return null; } // resilient upstream access [web:31][web:42]\n}\n\n// ---------- Fetch inputs ----------\n// Current item’s booked start_time (example: \"2025-10-27T07:00:00\")\nconst inputItem = $input.first(); // use the Code node’s current input to avoid back-reference issues [web:37][web:39]\nconst startTimeRaw = inputItem?.json?.start_time ?? null; // read from incoming item [web:39]\nconst originalDateStrFromInput = startTimeRaw ? String(startTimeRaw).slice(0, 10) : null; // YYYY-MM-DD from \"2025-10-27T07:00:00\" [web:32]\n\n// Optional: direct node lookup fallback if you prefer explicit source label on canvas\nconst findConfirmed = safeFirst('Find Confirmed Booking'); // will be null if label differs or node unexecuted [web:31]\nconst originalDateStrFromNode = findConfirmed ? (findConfirmed.json?.start_time ? String(findConfirmed.json.start_time).slice(0, 10) : null) : null; // slice to date-only [web:32]\n\n// Choose original date with priority: input item first, then explicit node\nconst originalDateStr = originalDateStrFromInput ?? originalDateStrFromNode; // robust selection between sources [web:34]\n\n// User-selected date from ParseAIOutput1\nconst parseNode = safeFirst('ParseAIOutput1'); // upstream AI parsing output [web:31]\nconst newDateStr = parseNode ? parseNode.json?.date ?? null : null; // user chosen date like \"2025-10-26\" [web:32]\nconst startTimeISO = parseNode ? parseNode.json?.startTimeISO ?? null : null; // passthrough [web:32]\nconst endTimeISO = parseNode ? parseNode.json?.endTimeISO ?? null : null; // passthrough [web:32]\nconst selectedTurfId = parseNode ? parseNode.json?.selected_turf_id ?? null : null; // passthrough [web:32]\nconst intent = parseNode ? parseNode.json?.intent ?? null : null; // passthrough [web:32]\n\n// ---------- Validation ----------\nconst originalDate = parseAsLocalStartOfDay(originalDateStr); // normalize base date [web:36]\nconst newDate = parseAsLocalStartOfDay(newDateStr); // normalize compare date [web:36]\nconst now = new Date(); // current moment in local TZ [web:43]\n\nlet isDateValid = false; // default fail [web:22]\nlet reason = null; // diagnostic [web:22]\n\nif (!originalDateStr) {\n  reason = 'Missing original booked date (start_time) on input or Find Confirmed Booking'; // explicit message for debugging [web:22]\n} else if (!newDateStr) {\n  reason = 'Missing user-selected reschedule date from ParseAIOutput1'; // explicit message [web:22]\n} else if (!originalDate || !newDate) {\n  reason = 'Invalid date format for original or new date'; // invalid parse [web:22]\n} else {\n  // Future check: new date must be strictly after today (tomorrow or later)\n  const todayLocalStart = parseAsLocalStartOfDay(now.toISOString()); // get today at local midnight via ISO and normalize [web:36][web:45]\n  const newIsFuture = dayDiff(todayLocalStart, newDate) >= 1; // require at least +1 day [web:3]\n\n  // Window check: within 7 days of original booking date (absolute difference)\n  const diffDays = Math.abs(dayDiff(originalDate, newDate)); // absolute window size [web:3]\n  const withinSeven = diffDays <= 7; // inclusive 7 days [web:3]\n\n  isDateValid = Boolean(newIsFuture && withinSeven); // final boolean [web:22]\n  if (!newIsFuture) reason = 'New date is not in the future'; // failure detail [web:22]\n  if (!withinSeven) reason = 'New date is more than 7 days away from original date'; // failure detail [web:22]\n}\n\n// ---------- Return ----------\nreturn [\n  {\n    json: {\n      isDateValid, // main flag [web:22]\n      reason, // diagnostic message [web:22]\n      // explicit echoes for downstream nodes\n      originalDate: originalDateStr, // date-only YYYY-MM-DD from existing booking [web:32]\n      newDate: newDateStr, // user-selected YYYY-MM-DD [web:32]\n      startTimeISO, // passthrough [web:32]\n      endTimeISO, // passthrough [web:32]\n      selected_turf_id: selectedTurfId, // passthrough [web:32]\n      intent, // passthrough [web:32]\n    },\n  },\n];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4880,
+        -240
+      ],
+      "id": "f48af781-6f46-402e-bd4f-a162562866fe",
+      "name": "Code5"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "Bookings",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        4704,
+        -240
+      ],
+      "id": "68623ce9-44f7-4616-8152-822b6207bdb9",
+      "name": "Get a row3",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b970aa83-b52f-4bc5-8f4a-d7ec56b05ebb",
+              "leftValue": "={{ $json.isDateValid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5072,
+        -240
+      ],
+      "id": "3f21ba65-8cd2-4231-92eb-9eacab104c57",
+      "name": "If1"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "=Sorry, reschedule must be within 7 days... Please provide both date and time.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        5296,
+        -144
+      ],
+      "id": "117426f7-9c93-4c48-a19f-12f6bf7b4b31",
+      "name": "Send an SMS/MMS/WhatsApp message15",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "last_question",
+              "fieldValue": "awaiting_reschedule_details"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        5472,
+        -144
+      ],
+      "id": "66d8cad2-26a8-4e32-bc02-d599aa8ca989",
+      "name": "Update a row5",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "tableId": "Bookings",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "turf_id",
+              "condition": "eq",
+              "keyValue": "={{ $json.selected_turf_id }}"
+            },
+            {
+              "keyName": "status",
+              "condition": "eq",
+              "keyValue": "confirmed"
+            },
+            {
+              "keyName": "start_time",
+              "condition": "lt",
+              "keyValue": "={{ $('ParseAIOutput1').item.json.endTimeISO }}"
+            },
+            {
+              "keyName": "end_time",
+              "condition": "gt",
+              "keyValue": "={{ $('ParseAIOutput1').item.json.startTimeISO }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        5280,
+        -368
+      ],
+      "id": "13509905-8ae1-4cd2-8fa2-f4cbab322f26",
+      "name": "Check Bookings for Overlap1",
+      "alwaysOutputData": true,
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get the items from the previous Supabase node\nconst overlaps = items;\n\n// Check if the list is empty OR if the first item is truly empty\n// (Handles both [] and [{}] cases)\nconst isAvailable = overlaps.length === 0 || !overlaps[0].json.id;\n\n// Output a simple true/false value\nreturn { json: { isSlotAvailable: isAvailable } };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5456,
+        -368
+      ],
+      "id": "a6d97dba-b614-4518-a228-b7cedf10b05f",
+      "name": "Process Overlap Check1"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "89d970a5-78c7-4257-a3b3-f03176801bfc",
+              "leftValue": "={{ $json.isSlotAvailable }}",
+              "rightValue": "is True",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5648,
+        -368
+      ],
+      "id": "1fc7af95-a468-484d-914b-f57fcfdda593",
+      "name": "IsSlotAvailable?"
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{ $('Webhook').item.json.body.WaId }}",
+        "toWhatsapp": true,
+        "message": "=Your slot has been rescheduled:\nTurf : {{ $json.name }}\nDate : {{ $('ParseAIOutput1').item.json.date }}\nTime : {{ DateTime.fromISO($('ParseAIOutput1').item.json.startTimeISO, { setZone: true }).toFormat('h:mm a') }} - {{ DateTime.fromISO($('ParseAIOutput1').item.json.endTimeISO, { setZone: true }).toFormat('h:mm a') }}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        6032,
+        -464
+      ],
+      "id": "d540fbf0-48a1-4b66-b5c7-539aeeca4276",
+      "name": "Send an SMS/MMS/WhatsApp message16",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "from": "+14155238886",
+        "to": "=+{{$node[\"Webhook\"].json.body.WaId}}",
+        "toWhatsapp": true,
+        "message": "=Sorry, that new time is also booked. Please provide both date and time.",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.twilio",
+      "typeVersion": 1,
+      "position": [
+        5872,
+        -272
+      ],
+      "id": "6ad8522c-f942-4e73-a73b-0be9876a3af1",
+      "name": "Send an SMS/MMS/WhatsApp message17",
+      "credentials": {
+        "twilioApi": {
+          "id": "WD6tABzn9aQDVT9s",
+          "name": "Twilio account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Sessions",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "last_question",
+              "fieldValue": "awaiting_reschedule_details"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        6048,
+        -272
+      ],
+      "id": "325933e1-763a-4877-ba32-67797262118c",
+      "name": "Update a row9",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "tableId": "Bookings",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "condition": "eq",
+              "keyValue": "={{ $('Get a row3').item.json.id }}"
+            }
+          ]
+        },
+        "fieldsUi": {
+          "fieldValues": [
+            {
+              "fieldId": "start_time",
+              "fieldValue": "={{ $('ParseAIOutput1').item.json.startTimeISO }}"
+            },
+            {
+              "fieldId": "end_time",
+              "fieldValue": "={{ $('ParseAIOutput1').item.json.endTimeISO }}"
+            },
+            {
+              "fieldId": "reschedule_count",
+              "fieldValue": "1"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        6400,
+        -464
+      ],
+      "id": "3b58f0cb-0fc7-4ec7-96f1-7fd99ad38853",
+      "name": "Update a row10",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "tableId": "Sessions",
+        "matchType": "allFilters",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "user_number",
+              "condition": "eq",
+              "keyValue": "=+{{ $('Webhook').item.json.body.WaId }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        6576,
+        -464
+      ],
+      "id": "6a4561b6-daa4-4788-a0a7-59b2f0ece49e",
+      "name": "Delete a row1",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Get a row4').item.json.owner_email }}",
+        "subject": "=Booking Rescheduled: Turf ID {{ $('Get a row4').item.json.id }} - {{ $('ParseAIOutput1').item.json.date }}",
+        "message": "=<!DOCTYPE html> <html> <head> <style>   body { font-family: sans-serif; line-height: 1.6; color: #333; }   .container { padding: 20px; border: 1px solid #ddd; border-radius: 5px; max-width: 600px; margin: 20px auto; }   h2 { color: #0066cc; border-bottom: 2px solid #eee; padding-bottom: 10px; }   ul { list-style: none; padding: 0; }   li { margin-bottom: 10px; }   strong { color: #555; } </style> </head> <body>   <div class=\"container\">     <h2>🎉 New Booking Confirmed via WhatsApp Bot!</h2>     <p>A new booking has been successfully confirmed and paid for.</p>     <h3>Booking Details:</h3>     <ul>       <li><strong>Customer Number:</strong> whatsapp:{{ $('Webhook').item.json.body.WaId }}</li>       <li><strong>Turf ID:</strong> {{ $('ParseAIOutput1').item.json.selected_turf_id }}</li>       <li><strong>Date:</strong> {{ $('ParseAIOutput1').item.json.date }}</li>       <li><strong>Start Time:</strong> {{ DateTime.fromISO($('ParseAIOutput1').item.json.startTimeISO, { setZone: true }).toFormat('h:mm a') }} (IST)</li>       <li><strong>End Time:</strong> {{ DateTime.fromISO($('ParseAIOutput1').item.json.endTimeISO, { setZone: true }).toFormat('h:mm a') }} (IST)</li>     </ul>     <p>This slot is now marked as booked.</p>   </div> </body> </html>",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        6224,
+        -464
+      ],
+      "id": "d6038d52-4244-4f0f-8224-0024ba46b381",
+      "name": "Send a message",
+      "webhookId": "d518c24e-9b54-42a4-b5ce-cea98ae3f415",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "GLMxnXfzY2NEDumH",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "tableId": "Turfs",
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "id",
+              "keyValue": "={{ $('ParseAIOutput1').item.json.selected_turf_id }}"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        5856,
+        -464
+      ],
+      "id": "b670e7e6-1e78-422a-a249-c363e0d01bf9",
+      "name": "Get a row4",
+      "credentials": {
+        "supabaseApi": {
+          "id": "obLFDTL5KUypuh0y",
+          "name": "Supabase account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Get a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a row": {
+      "main": [
+        [
+          {
+            "node": "Switch4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Message a model1": {
+      "main": [
+        [
+          {
+            "node": "ParseAIOutput1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "ParseAIOutput1": {
+      "main": [
+        [
+          {
+            "node": "Switch1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Are all details complete?": {
+      "main": [
+        [
+          {
+            "node": "Get a row1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Missing Info Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Missing Info Reply": {
+      "main": [
+        [
+          {
+            "node": "Update a row2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many rows": {
+      "main": [
+        [
+          {
+            "node": "Build Turf List Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Turf List Message": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message6",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message6": {
+      "main": [
+        [
+          {
+            "node": "Create a row1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Get many rows",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get many rows1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Message a model1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "If2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Message a model1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update a row6",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Message a model1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Get many rows1": {
+      "main": [
+        [
+          {
+            "node": "Find Selected Turf",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Selected Turf": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message7": {
+      "main": [
+        [
+          {
+            "node": "Update a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a row1": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message9",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message9": {
+      "main": [
+        [
+          {
+            "node": "Update a row1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update a row2": {
+      "main": [
+        []
+      ]
+    },
+    "Check Bookings for Overlap": {
+      "main": [
+        [
+          {
+            "node": "Process Overlap Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IsSlotAvailable?2": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get user requested slot details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request2": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Overlap Check": {
+      "main": [
+        [
+          {
+            "node": "IsSlotAvailable?2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get all Bookings today": {
+      "main": [
+        [
+          {
+            "node": "Generate suggestions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If2": {
+      "main": [
+        [
+          {
+            "node": "Switch2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Message a model1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch2": {
+      "main": [
+        [
+          {
+            "node": "Check Bookings for Overlap",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get user requested slot details": {
+      "main": [
+        [
+          {
+            "node": "Get all Bookings today",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate suggestions": {
+      "main": [
+        [
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch1": {
+      "main": [
+        [
+          {
+            "node": "Are all details complete?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Are all details complete?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Are all details complete?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Are all details complete?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Are all details complete?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "not available turfs",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message11",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message12",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Are all details complete?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get a row3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message11": {
+      "main": [
+        [
+          {
+            "node": "Delete a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message12": {
+      "main": [
+        [
+          {
+            "node": "Update a row3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message13",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message13": {
+      "main": [
+        [
+          {
+            "node": "Update a row4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get all the details": {
+      "main": [
+        [
+          {
+            "node": "Get many rows2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update a row6": {
+      "main": [
+        [
+          {
+            "node": "Get all the details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message14": {
+      "main": [
+        [
+          {
+            "node": "Update a row7",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many rows2": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message14",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "not available turfs": {
+      "main": [
+        [
+          {
+            "node": "Code2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code2": {
+      "main": [
+        [
+          {
+            "node": "Get many rows3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many rows3": {
+      "main": [
+        [
+          {
+            "node": "Code3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code3": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message": {
+      "main": [
+        [
+          {
+            "node": "Get a row2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a row2": {
+      "main": [
+        [
+          {
+            "node": "Update a row8",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch3": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Can Reschedule?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message1": {
+      "main": [
+        [
+          {
+            "node": "Create a row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Confirmed Booking": {
+      "main": [
+        [
+          {
+            "node": "Switch3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Can Reschedule?": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get many rows4": {
+      "main": [
+        [
+          {
+            "node": "Code4",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message8",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message8": {
+      "main": [
+        []
+      ]
+    },
+    "Switch4": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get many rows4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get many rows4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find Confirmed Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code4": {
+      "main": [
+        [
+          {
+            "node": "If",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a row3": {
+      "main": [
+        [
+          {
+            "node": "Code5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code5": {
+      "main": [
+        [
+          {
+            "node": "If1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If1": {
+      "main": [
+        [
+          {
+            "node": "Check Bookings for Overlap1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message15",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message15": {
+      "main": [
+        [
+          {
+            "node": "Update a row5",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Bookings for Overlap1": {
+      "main": [
+        [
+          {
+            "node": "Process Overlap Check1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Overlap Check1": {
+      "main": [
+        [
+          {
+            "node": "IsSlotAvailable?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IsSlotAvailable?": {
+      "main": [
+        [
+          {
+            "node": "Get a row4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message17",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message17": {
+      "main": [
+        [
+          {
+            "node": "Update a row9",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send an SMS/MMS/WhatsApp message16": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update a row10": {
+      "main": [
+        [
+          {
+            "node": "Delete a row1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a message": {
+      "main": [
+        [
+          {
+            "node": "Update a row10",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get a row4": {
+      "main": [
+        [
+          {
+            "node": "Send an SMS/MMS/WhatsApp message16",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "7ebe6948-7468-4f63-97c1-06a0b99c98a5",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "1e3d78e77134f1c2c70fb033c7096f3c2f8219a299020aadf1bd35e49449ee17"
+  },
+  "id": "TGxrLyNR5lYyjbwR",
+  "tags": []
+}
